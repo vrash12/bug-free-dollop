@@ -1,0 +1,13 @@
+Flask>=2.3,<4
+Flask-JWT-Extended>=4.5,<5
+Flask-SQLAlchemy>=3.1,<4
+SQLAlchemy>=2.0,<3
+gunicorn>=21,<23
+
+# optional but common in Flask APIs
+Flask-Cors>=4.0,<5
+python-dotenv>=1.0,<2
+
+# DB driver (uncomment the one you actually use)
+# psycopg2-binary>=2.9,<3     # PostgreSQL
+ PyMySQL>=1.1,<2             # MySQL
