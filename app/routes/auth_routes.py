@@ -4,6 +4,7 @@ from __future__ import annotations
 from flask import Blueprint, current_app, jsonify, request
 from flask_jwt_extended import create_access_token, get_jwt_identity, jwt_required
 from sqlalchemy import or_
+from sqlalchemy.exc import OperationalError
 
 from .. import db
 from ..models.user import User
@@ -14,16 +15,13 @@ auth_bp = Blueprint("auth", __name__)
 print("[auth_routes] LOADED FROM:", __file__)
 
 
-# -----------------------------
-# Routes (NO CV / Face Recognition)
-# -----------------------------
 @auth_bp.route("/register", methods=["POST"])
 def register():
     data = request.get_json(silent=True) or {}
 
     email = (data.get("email") or "").strip().lower()
     username = (data.get("username") or "").strip()
-    password = data.get("password") or ""  # do NOT strip passwords
+    password = data.get("password") or ""
 
     if not email or not username or not password:
         return jsonify({"message": "email, username and password are required"}), 400
@@ -31,11 +29,16 @@ def register():
     if len(password) < 6:
         return jsonify({"message": "password must be at least 6 characters"}), 400
 
-    if User.query.filter_by(email=email).first():
-        return jsonify({"message": "email already in use"}), 400
+    try:
+        if User.query.filter_by(email=email).first():
+            return jsonify({"message": "email already in use"}), 400
 
-    if User.query.filter_by(username=username).first():
-        return jsonify({"message": "username already in use"}), 400
+        if User.query.filter_by(username=username).first():
+            return jsonify({"message": "username already in use"}), 400
+
+    except OperationalError as e:
+        current_app.logger.exception(f"[auth/register] DB unavailable: {e}")
+        return jsonify({"message": "Database unavailable. Please try again."}), 503
 
     user = User(email=email, username=username, display_name=username)
     user.set_password(password)
@@ -46,6 +49,11 @@ def register():
 
         access_token = create_access_token(identity=str(user.id))
         return jsonify({"token": access_token, "user": user.to_dict()}), 201
+
+    except OperationalError as e:
+        db.session.rollback()
+        current_app.logger.exception(f"[auth/register] DB error: {e}")
+        return jsonify({"message": "Database unavailable. Please try again."}), 503
 
     except Exception as e:
         db.session.rollback()
