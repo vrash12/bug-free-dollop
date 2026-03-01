@@ -60,6 +60,7 @@ def register():
         current_app.logger.exception(f"Registration Error: {e}")
         return jsonify({"message": "Internal server error"}), 500
 
+#E
 
 @auth_bp.route("/login", methods=["POST"])
 def login():
