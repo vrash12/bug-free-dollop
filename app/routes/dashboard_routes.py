@@ -6,11 +6,13 @@ from typing import Any, Optional
 
 from flask import Blueprint, jsonify, request
 from flask_jwt_extended import get_jwt_identity, jwt_required
+from sqlalchemy import and_
 
 from .. import db
+from ..models.social import Challenge, ChallengeParticipant
 from ..models.user import User
-from ..models.workout import Workout
 from ..models.user_daily_stats import UserDailyStats
+from ..models.workout import Workout
 
 # Blueprint for dashboard-related endpoints
 dashboard_bp = Blueprint("dashboard", __name__)
@@ -240,6 +242,137 @@ def start_workout():
 
 
 # -------------------------
+# LIVE PROGRESS (SAVE REPS DURING WORKOUT)
+# -------------------------
+@workout_bp.route("/progress", methods=["POST"])
+@jwt_required()
+def workout_progress():
+    """
+    Saves in-progress totals so every rep can be reflected in SQL.
+
+    Body:
+    {
+      "workout_id": 123,
+      "total_reps": 17,
+      "total_points_earned": 170
+    }
+
+    Rules:
+    - Monotonic: totals only increase (never decrease).
+    - Credits ONLY the delta to the user's totals and daily stats.
+    - Does NOT increment daily total_workouts (that happens on /complete).
+    - If workout already ended, returns current data and does nothing.
+    """
+    current_user_id = int(get_jwt_identity())
+    data = request.get_json() or {}
+
+    workout_id = data.get("workout_id")
+    if workout_id is None:
+        return jsonify({"message": "workout_id is required"}), 400
+
+    try:
+        workout_id = int(workout_id)
+    except (TypeError, ValueError):
+        return jsonify({"message": "workout_id must be an integer"}), 400
+
+    workout = Workout.query.filter_by(id=workout_id, user_id=current_user_id).first()
+    if not workout:
+        return jsonify({"message": "Workout not found"}), 404
+
+    # If already completed, don't change totals
+    if workout.ended_at is not None:
+        user = User.query.get(current_user_id)
+        return (
+            jsonify(
+                {
+                    "message": "Workout already completed",
+                    "workout": workout.to_summary_dict(),
+                    "user": user.to_dict() if user else None,
+                }
+            ),
+            200,
+        )
+
+    prev_reps = int(workout.total_reps or 0)
+    prev_points = int(workout.total_points_earned or 0)
+
+    req_reps = _safe_int(data.get("total_reps"), default=prev_reps)
+    req_points = _safe_int(data.get("total_points_earned"), default=prev_points)
+
+    # Monotonic (never go backwards)
+    new_reps = max(prev_reps, req_reps)
+    new_points = max(prev_points, req_points)
+
+    reps_delta = new_reps - prev_reps
+    points_delta = new_points - prev_points
+
+    # No changes => noop
+    if reps_delta == 0 and points_delta == 0:
+        user = User.query.get(current_user_id)
+        return (
+            jsonify(
+                {
+                    "message": "No progress change",
+                    "workout": workout.to_summary_dict(),
+                    "user": user.to_dict() if user else None,
+                }
+            ),
+            200,
+        )
+
+    now = datetime.utcnow()
+    today = now.date()
+
+    try:
+        # Update workout running totals
+        workout.total_reps = new_reps
+        workout.total_points_earned = new_points
+
+        user = User.query.get(current_user_id)
+        if not user:
+            return jsonify({"message": "user not found"}), 404
+
+        # Credit ONLY the delta to the user's totals
+        if points_delta > 0:
+            user.total_points = int(getattr(user, "total_points", 0) or 0) + points_delta
+            _update_user_level_from_points(user)
+
+        # Any rep/points means the user was active today
+        _update_user_streak(user, today)
+
+        # Daily stats (DO NOT increment workouts count here)
+        stats = _get_or_create_daily_stats(user.id, today)
+        if points_delta > 0:
+            stats.total_points = int(getattr(stats, "total_points", 0) or 0) + points_delta
+        if reps_delta > 0:
+            stats.total_reps = int(getattr(stats, "total_reps", 0) or 0) + reps_delta
+
+        db.session.commit()
+
+        return (
+            jsonify(
+                {
+                    "message": "Progress saved",
+                    "workout": workout.to_summary_dict(),
+                    "user": user.to_dict(),
+                    "today": {
+                        "date": today.isoformat(),
+                        "points": int(stats.total_points or 0),
+                        "workouts": int(stats.total_workouts or 0),
+                        "duration_seconds": int(stats.total_duration_seconds or 0),
+                        "reps": int(stats.total_reps or 0),
+                    },
+                }
+            ),
+            200,
+        )
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"message": "Failed to save progress", "error": str(e)}), 500
+
+
+# -------------------------
 # COMPLETE WORKOUT
 # -------------------------
 @workout_bp.route("/complete", methods=["POST"])
@@ -279,6 +412,16 @@ def complete_workout():
     total_points_earned = _safe_int(data.get("total_points_earned"), default=0)
     total_reps = _safe_int(data.get("total_reps"), default=0)
 
+    # Delta-safe finalize (prevents double counting if /progress was used)
+    prev_points = int(workout.total_points_earned or 0)
+    prev_reps = int(workout.total_reps or 0)
+
+    final_points = max(prev_points, total_points_earned)
+    final_reps = max(prev_reps, total_reps)
+
+    points_delta = final_points - prev_points
+    reps_delta = final_reps - prev_reps
+
     now = datetime.utcnow()
     today = now.date()
 
@@ -286,11 +429,10 @@ def complete_workout():
         # finalize workout
         workout.ended_at = now
         workout.total_duration_seconds = total_duration_seconds
-        workout.total_points_earned = total_points_earned
-        workout.total_reps = total_reps
+        workout.total_points_earned = final_points
+        workout.total_reps = final_reps
 
         if getattr(workout, "calories_estimate", None) is None:
-            # keep it non-null if your schema expects it
             workout.calories_estimate = 0
 
         # update user totals + streak
@@ -298,16 +440,61 @@ def complete_workout():
         if not user:
             return jsonify({"message": "user not found"}), 404
 
-        user.total_points = int(getattr(user, "total_points", 0) or 0) + total_points_earned
+        # ONLY add the remaining delta (if progress already credited some/all)
+        if points_delta > 0:
+            user.total_points = int(getattr(user, "total_points", 0) or 0) + points_delta
+
         _update_user_level_from_points(user)
         _update_user_streak(user, today)
 
         # update daily stats
         stats = _get_or_create_daily_stats(user.id, today)
-        stats.total_points = int(getattr(stats, "total_points", 0) or 0) + total_points_earned
+        if points_delta > 0:
+            stats.total_points = int(getattr(stats, "total_points", 0) or 0) + points_delta
+        if reps_delta > 0:
+            stats.total_reps = int(getattr(stats, "total_reps", 0) or 0) + reps_delta
+
+        # workouts + duration are only finalized here
         stats.total_workouts = int(getattr(stats, "total_workouts", 0) or 0) + 1
-        stats.total_duration_seconds = int(getattr(stats, "total_duration_seconds", 0) or 0) + total_duration_seconds
-        stats.total_reps = int(getattr(stats, "total_reps", 0) or 0) + total_reps
+        stats.total_duration_seconds = (
+            int(getattr(stats, "total_duration_seconds", 0) or 0) + total_duration_seconds
+        )
+
+        # ---------------------------------------------------------
+        # ✅ Update running challenge progress (incremental, once)
+        # ---------------------------------------------------------
+        running = (
+            db.session.query(ChallengeParticipant, Challenge)
+            .join(Challenge, ChallengeParticipant.challenge_id == Challenge.id)
+            .filter(
+                ChallengeParticipant.user_id == current_user_id,
+                Challenge.is_active.is_(True),
+                Challenge.start_date <= today,
+                Challenge.end_date >= today,
+            )
+            .all()
+        )
+
+        workout_exercise_id = (workout.exercise_id or "").strip().lower()
+
+        for cp, ch in running:
+            ch_exercise_id = (getattr(ch, "exercise_id", None) or "").strip().lower()
+            if ch_exercise_id and ch_exercise_id != workout_exercise_id:
+                continue
+
+            metric = (ch.metric_type or "").lower()
+
+            if metric == "workouts":
+                add_value = 1
+            elif metric == "points":
+                add_value = int(final_points)
+            elif metric == "duration_seconds":
+                add_value = int(total_duration_seconds)
+            else:  # reps
+                add_value = int(final_reps)
+
+            if add_value:
+                cp.progress_value = int(getattr(cp, "progress_value", 0) or 0) + add_value
 
         db.session.commit()
 
@@ -346,6 +533,7 @@ def analyze_exercise_frame(exercise_id: str):
 
     Your app should do pose/rep detection on-device and only call:
       - POST /workouts/start
+      - POST /workouts/progress   (optional, for live syncing)
       - POST /workouts/complete
     """
     return (

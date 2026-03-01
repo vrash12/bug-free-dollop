@@ -1,4 +1,6 @@
 # backend/app/models/social.py
+from __future__ import annotations
+
 from datetime import datetime
 from .. import db
 
@@ -36,9 +38,7 @@ class UserAchievement(db.Model):
     id = db.Column(db.BigInteger, primary_key=True)
     user_id = db.Column(db.BigInteger, db.ForeignKey("users.id"), nullable=False)
     achievement_id = db.Column(db.Integer, db.ForeignKey("achievements.id"), nullable=False)
-    unlocked_at = db.Column(
-        db.DateTime, nullable=False, default=datetime.utcnow
-    )
+    unlocked_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
     user = db.relationship("User", backref="user_achievements")
     achievement = db.relationship("Achievement", backref="user_achievements")
@@ -66,16 +66,12 @@ class Friendship(db.Model):
         onupdate=datetime.utcnow,
     )
 
-    requester = db.relationship(
-        "User", foreign_keys=[requester_id], backref="sent_friendships"
-    )
-    addressee = db.relationship(
-        "User", foreign_keys=[addressee_id], backref="received_friendships"
-    )
+    requester = db.relationship("User", foreign_keys=[requester_id], backref="sent_friendships")
+    addressee = db.relationship("User", foreign_keys=[addressee_id], backref="received_friendships")
 
 
 # -----------------------------
-# Challenges
+# Challenges (supports single OR multi-items)
 # -----------------------------
 class Challenge(db.Model):
     __tablename__ = "challenges"
@@ -86,17 +82,18 @@ class Challenge(db.Model):
     created_by = db.Column(db.BigInteger, db.ForeignKey("users.id"), nullable=False)
     start_date = db.Column(db.Date, nullable=False)
     end_date = db.Column(db.Date, nullable=False)
+
     metric_type = db.Column(
-        db.Enum(
-            "reps",
-            "points",
-            "duration_seconds",
-            "workouts",
-            name="challenge_metric_type",
-        ),
+        db.Enum("reps", "points", "duration_seconds", "workouts", name="challenge_metric_type"),
         nullable=False,
     )
-    target_value = db.Column(db.Integer)
+
+    # legacy single-item metadata (still in your SQL)
+    exercise_id = db.Column(db.String(50))
+    difficulty = db.Column(db.String(20))
+    preset_id = db.Column(db.String(64))
+
+    target_value = db.Column(db.Integer)  # total target (sum of items)
     is_active = db.Column(db.Boolean, nullable=False, default=True)
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
@@ -106,6 +103,27 @@ class Challenge(db.Model):
         back_populates="challenge",
         cascade="all, delete-orphan",
     )
+    items = db.relationship(
+        "ChallengeItem",
+        back_populates="challenge",
+        cascade="all, delete-orphan",
+    )
+
+
+class ChallengeItem(db.Model):
+    __tablename__ = "challenge_items"
+
+    id = db.Column(db.BigInteger, primary_key=True)
+    challenge_id = db.Column(db.BigInteger, db.ForeignKey("challenges.id"), nullable=False)
+
+    exercise_id = db.Column(db.String(50), nullable=False)
+    difficulty = db.Column(db.String(20))
+    preset_id = db.Column(db.String(64))
+
+    target_value = db.Column(db.Integer, nullable=False, default=0)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+    challenge = db.relationship("Challenge", back_populates="items")
 
 
 class ChallengeParticipant(db.Model):
@@ -146,9 +164,7 @@ class Exercise(db.Model):
     points_per_rep = db.Column(db.Integer, nullable=False, default=1)
     points_per_minute = db.Column(db.Integer, nullable=False, default=1)
 
-    sessions = db.relationship(
-        "ExerciseSession", back_populates="exercise", cascade="all, delete-orphan"
-    )
+    sessions = db.relationship("ExerciseSession", back_populates="exercise", cascade="all, delete-orphan")
 
 
 class ExerciseSession(db.Model):
@@ -167,23 +183,16 @@ class ExerciseSession(db.Model):
 
     workout = db.relationship("Workout", backref="exercise_sessions")
     exercise = db.relationship("Exercise", back_populates="sessions")
-    pose_metrics = db.relationship(
-        "PoseMetric", back_populates="exercise_session", cascade="all, delete-orphan"
-    )
+    pose_metrics = db.relationship("PoseMetric", back_populates="exercise_session", cascade="all, delete-orphan")
 
 
 class PoseMetric(db.Model):
     __tablename__ = "pose_metrics"
 
     id = db.Column(db.BigInteger, primary_key=True)
-    exercise_session_id = db.Column(
-        db.BigInteger,
-        db.ForeignKey("exercise_sessions.id"),
-        nullable=False,
-    )
+    exercise_session_id = db.Column(db.BigInteger, db.ForeignKey("exercise_sessions.id"), nullable=False)
     metric_name = db.Column(db.String(100), nullable=False)
     metric_value = db.Column(db.Numeric(10, 4))
-    # assuming MySQL 5.7+/8 with JSON support
     metric_json = db.Column(db.JSON)
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
@@ -194,9 +203,6 @@ class PoseMetric(db.Model):
 # Global leaderboard view (read-only)
 # -----------------------------
 class GlobalLeaderboard(db.Model):
-    """
-    Read-only mapping to the `global_leaderboard` view.
-    """
     __tablename__ = "global_leaderboard"
 
     user_id = db.Column(db.BigInteger, primary_key=True)
